@@ -1,4 +1,19 @@
+import { mockApi } from './mockData'
+
 const API_URL = 'http://localhost:8000';
+
+let useDemo = false;
+
+// Check if backend is available, fallback to demo mode
+async function checkBackend() {
+  try {
+    const res = await fetch(`${API_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (res.ok) { useDemo = false; return; }
+  } catch {}
+  useDemo = true;
+  console.log('Backend unavailable - demo mode active');
+}
+checkBackend();
 
 async function fetchAPI(endpoint, options = {}) {
   const res = await fetch(`${API_URL}${endpoint}`, {
@@ -12,47 +27,73 @@ async function fetchAPI(endpoint, options = {}) {
   return res.json();
 }
 
+function withFallback(apiFn, mockFn) {
+  return async (...args) => {
+    if (useDemo) return mockFn(...args);
+    try {
+      return await apiFn(...args);
+    } catch {
+      useDemo = true;
+      return mockFn(...args);
+    }
+  };
+}
+
 export const api = {
   // Hesaplar
-  getHesaplar: () => fetchAPI('/hesaplar'),
-  getHesap: (id) => fetchAPI(`/hesaplar/${id}`),
-  createHesap: (data) => fetchAPI('/hesaplar', { method: 'POST', body: JSON.stringify(data) }),
-  deleteHesap: (id) => fetchAPI(`/hesaplar/${id}`, { method: 'DELETE' }),
+  getHesaplar: withFallback(() => fetchAPI('/hesaplar'), mockApi.getHesaplar),
+  getHesap: withFallback((id) => fetchAPI(`/hesaplar/${id}`), mockApi.getHesap),
+  createHesap: withFallback((data) => fetchAPI('/hesaplar', { method: 'POST', body: JSON.stringify(data) }), mockApi.createHesap),
+  deleteHesap: withFallback((id) => fetchAPI(`/hesaplar/${id}`, { method: 'DELETE' }), mockApi.deleteHesap),
+  getHesapBakiye: withFallback((id) => fetchAPI(`/hesaplar/${id}/bakiye`), mockApi.getHesapBakiye),
 
   // Özet
-  getOzet: () => fetchAPI('/ozet'),
+  getOzet: withFallback(() => fetchAPI('/ozet'), mockApi.getOzet),
 
   // Hareketler
-  getHareketler: (hesapId, params = {}) => {
+  getHareketler: withFallback((hesapId, params = {}) => {
     const qs = new URLSearchParams(params).toString();
     return fetchAPI(`/hesaplar/${hesapId}/hareketler${qs ? '?' + qs : ''}`);
-  },
-  addHareket: (hesapId, data) => fetchAPI(`/hesaplar/${hesapId}/hareketler`, {
+  }, mockApi.getHareketler),
+  getTumHareketler: withFallback((params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return fetchAPI(`/tum-hareketler${qs ? '?' + qs : ''}`);
+  }, mockApi.getTumHareketler),
+  addHareket: withFallback((hesapId, data) => fetchAPI(`/hesaplar/${hesapId}/hareketler`, {
     method: 'POST', body: JSON.stringify(data)
-  }),
-  deleteHareket: (id) => fetchAPI(`/hareketler/${id}`, { method: 'DELETE' }),
+  }), mockApi.addHareket),
+  deleteHareket: withFallback((id) => fetchAPI(`/hareketler/${id}`, { method: 'DELETE' }), mockApi.deleteHareket),
 
   // Raporlar
-  createRapor: (data) => fetchAPI('/raporlar/olustur', { method: 'POST', body: JSON.stringify(data) }),
+  createRapor: withFallback((data) => fetchAPI('/raporlar/olustur', { method: 'POST', body: JSON.stringify(data) }), mockApi.createRapor),
+  getDetayliRapor: withFallback((params = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return fetchAPI(`/raporlar/detayli${qs ? '?' + qs : ''}`);
+  }, mockApi.getDetayliRapor),
 
   // Upload
-  uploadPDF: (hesapId, file) => {
+  uploadPDF: withFallback((hesapId, file) => {
     const form = new FormData();
-    form.append('hesap_id', hesapId);
     form.append('dosya', file);
-    return fetch(`${API_URL}/pdf-yukle`, {
-      method: 'POST',
-      body: form,
+    return fetch(`${API_URL}/pdf-yukle?hesap_id=${hesapId}`, {
+      method: 'POST', body: form,
     }).then(r => r.json());
-  },
+  }, mockApi.uploadPDF),
+  uploadExcel: withFallback((hesapId, file) => {
+    const form = new FormData();
+    form.append('dosya', file);
+    return fetch(`${API_URL}/excel-yukle?hesap_id=${hesapId}`, {
+      method: 'POST', body: form,
+    }).then(r => r.json());
+  }, mockApi.uploadExcel),
 
   // Rehber
-  getRehber: () => fetchAPI('/rehber'),
-  addRehber: (data) => fetchAPI('/rehber', { method: 'POST', body: JSON.stringify(data) }),
-  sendRapor: (raporId, data) => fetchAPI(`/raporlar/${raporId}/gonder`, { method: 'POST', body: JSON.stringify(data) }),
+  getRehber: withFallback(() => fetchAPI('/rehber'), mockApi.getRehber),
+  addRehber: withFallback((data) => fetchAPI('/rehber', { method: 'POST', body: JSON.stringify(data) }), mockApi.addRehber),
+  sendRapor: withFallback((raporId, data) => fetchAPI(`/raporlar/${raporId}/gonder`, { method: 'POST', body: JSON.stringify(data) }), mockApi.sendRapor),
 
   // Health
-  health: () => fetchAPI('/health'),
+  health: withFallback(() => fetchAPI('/health'), mockApi.health),
 };
 
 export default api;

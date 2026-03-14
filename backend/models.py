@@ -28,6 +28,8 @@ class BankaHesap(Base):
     hesap_numarasi = Column(String(50))
     valyuta = Column(String(3), default="AZN")
     voen = Column(String(20))  # 3102780631
+    acilis_bakiye = Column(Numeric(15, 2))
+    kapanis_bakiye = Column(Numeric(15, 2))
     acilis_tarihi = Column(DateTime)
     aktif = Column(Boolean, default=True)
     olusturma_tarihi = Column(DateTime, default=datetime.now)

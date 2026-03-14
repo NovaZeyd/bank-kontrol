@@ -3,11 +3,11 @@ Bank Kontrol Sistemi - FastAPI Backend
 Ana uygulama dosyası
 """
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, extract
 from datetime import datetime, timedelta
 from typing import List, Optional
 from decimal import Decimal
@@ -21,6 +21,8 @@ from pdf_parser import PDFBankaParser, ExcelExporter
 from pydantic import BaseModel, Field
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+import pandas as pd
+import io
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/bank_kontrol")
@@ -318,6 +320,274 @@ def pdf_yukle(
         "bank_type": sonuc["bank_type"],
         "toplam_medaxil": float(sonuc["toplam_medaxil"]),
         "toplam_mexaric": float(sonuc["toplam_mexaric"])
+    }
+
+# ============ EXCEL YUKLEME ============
+
+@app.post("/excel-yukle")
+def excel_yukle(
+    hesap_id: int,
+    dosya: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Excel ekstre yüklə və emal et"""
+    if not dosya.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="Yalnız Excel faylları dəstəklənir (.xlsx, .xls)")
+
+    hesap = db.query(BankaHesap).filter(BankaHesap.id == hesap_id).first()
+    if not hesap:
+        raise HTTPException(status_code=404, detail="Hesab tapılmadı")
+
+    icerik = dosya.file.read()
+    try:
+        df = pd.read_excel(io.BytesIO(icerik))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Excel oxuma xətası: {str(e)}")
+
+    # Sütun adlarını normallaşdır
+    col_map = {}
+    for col in df.columns:
+        cl = str(col).lower().strip()
+        if any(x in cl for x in ['tarix', 'date', 'tarixi']):
+            col_map['tarixi'] = col
+        elif any(x in cl for x in ['məbləğ', 'meblağ', 'mebleg', 'amount', 'sum']):
+            col_map['mebleg'] = col
+        elif any(x in cl for x in ['debet', 'debit', 'məxaric', 'mexaric', 'xərc']):
+            col_map['debet'] = col
+        elif any(x in cl for x in ['kredit', 'credit', 'mədaxil', 'medaxil', 'gəlir']):
+            col_map['kredit'] = col
+        elif any(x in cl for x in ['qalıq', 'qaliq', 'balance', 'bakiye']):
+            col_map['bakiye'] = col
+        elif any(x in cl for x in ['təyinat', 'teyinat', 'açıqlama', 'description', 'purpose']):
+            col_map['teyinat'] = col
+        elif any(x in cl for x in ['hesab', 'account', 'əks', 'acs']):
+            col_map['acs_hesap'] = col
+        elif any(x in cl for x in ['sənəd', 'sened', 'doc', 'nömrə']):
+            col_map['sened_no'] = col
+        elif any(x in cl for x in ['valyuta', 'currency']):
+            col_map['valyuta'] = col
+
+    eklenen = 0
+    for _, row in df.iterrows():
+        try:
+            # Tarixi al
+            if 'tarixi' in col_map:
+                tarixi_val = row[col_map['tarixi']]
+                if isinstance(tarixi_val, str):
+                    for fmt in ['%d.%m.%Y', '%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y']:
+                        try:
+                            tarixi = datetime.strptime(tarixi_val.strip(), fmt)
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        continue
+                else:
+                    tarixi = pd.Timestamp(tarixi_val).to_pydatetime()
+            else:
+                continue
+
+            # Məbləği al
+            if 'debet' in col_map and 'kredit' in col_map:
+                debet = float(row[col_map['debet']] or 0) if pd.notna(row[col_map['debet']]) else 0
+                kredit = float(row[col_map['kredit']] or 0) if pd.notna(row[col_map['kredit']]) else 0
+                if kredit > 0:
+                    mebleg = Decimal(str(kredit))
+                    islem_turu = IslemTuru.MEDAXIL
+                else:
+                    mebleg = Decimal(str(debet))
+                    islem_turu = IslemTuru.MEXARIC
+            elif 'mebleg' in col_map:
+                mebleg_val = float(row[col_map['mebleg']])
+                mebleg = Decimal(str(abs(mebleg_val)))
+                islem_turu = IslemTuru.MEDAXIL if mebleg_val > 0 else IslemTuru.MEXARIC
+            else:
+                continue
+
+            bakiye = None
+            if 'bakiye' in col_map and pd.notna(row[col_map['bakiye']]):
+                bakiye = Decimal(str(float(row[col_map['bakiye']])))
+
+            db_hareket = BankaHareketi(
+                hesap_id=hesap_id,
+                tarixi=tarixi,
+                islem_turu=islem_turu,
+                mebleg=mebleg,
+                valyuta=row[col_map['valyuta']] if 'valyuta' in col_map and pd.notna(row[col_map['valyuta']]) else "AZN",
+                bakiye=bakiye,
+                teyinat=str(row[col_map['teyinat']]) if 'teyinat' in col_map and pd.notna(row[col_map['teyinat']]) else None,
+                acs_hesap=str(row[col_map['acs_hesap']]) if 'acs_hesap' in col_map and pd.notna(row[col_map['acs_hesap']]) else None,
+                sened_no=str(row[col_map['sened_no']]) if 'sened_no' in col_map and pd.notna(row[col_map['sened_no']]) else None,
+                kaynak_dosya=dosya.filename
+            )
+            db.add(db_hareket)
+            eklenen += 1
+
+        except Exception:
+            continue
+
+    db.commit()
+
+    return {
+        "message": f"{eklenen} hərəkət əlavə edildi",
+        "toplam_setir": len(df),
+        "eklenen": eklenen,
+        "fayl_adi": dosya.filename
+    }
+
+# ============ DETAYLI RAPORLAMA ============
+
+@app.get("/raporlar/detayli")
+def detayli_rapor(
+    hesap_id: Optional[int] = None,
+    rapor_turu: str = Query("aylik", regex="^(gunluk|aylik|illik)$"),
+    baslangic: Optional[str] = None,
+    bitis: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Detaylı rapor - günlük/aylıq/illik qruplaşdırma ilə"""
+    query = db.query(BankaHareketi)
+
+    if hesap_id:
+        query = query.filter(BankaHareketi.hesap_id == hesap_id)
+
+    if baslangic:
+        query = query.filter(BankaHareketi.tarixi >= datetime.strptime(baslangic, "%Y-%m-%d"))
+    if bitis:
+        query = query.filter(BankaHareketi.tarixi <= datetime.strptime(bitis, "%Y-%m-%d"))
+
+    hareketler = query.order_by(BankaHareketi.tarixi.desc()).all()
+
+    # Qruplaşdırma
+    gruplar = {}
+    for h in hareketler:
+        if rapor_turu == "gunluk":
+            key = h.tarixi.strftime("%Y-%m-%d")
+        elif rapor_turu == "aylik":
+            key = h.tarixi.strftime("%Y-%m")
+        else:
+            key = h.tarixi.strftime("%Y")
+
+        if key not in gruplar:
+            gruplar[key] = {"donem": key, "medaxil": 0, "mexaric": 0, "sayi": 0, "hareketler": []}
+
+        mebleg_val = float(h.mebleg)
+        if h.islem_turu == IslemTuru.MEDAXIL or mebleg_val > 0:
+            gruplar[key]["medaxil"] += abs(mebleg_val)
+        else:
+            gruplar[key]["mexaric"] += abs(mebleg_val)
+        gruplar[key]["sayi"] += 1
+        gruplar[key]["hareketler"].append({
+            "id": h.id,
+            "tarixi": h.tarixi.isoformat(),
+            "islem_turu": h.islem_turu.value if isinstance(h.islem_turu, IslemTuru) else str(h.islem_turu),
+            "mebleg": float(h.mebleg),
+            "valyuta": h.valyuta,
+            "bakiye": float(h.bakiye) if h.bakiye else None,
+            "teyinat": h.teyinat,
+            "acs_hesap": h.acs_hesap,
+            "sened_no": h.sened_no,
+            "kategori": h.kategori,
+        })
+
+    # Kateqoriya analizi
+    kategoriler = {}
+    for h in hareketler:
+        kat = h.kategori or h.acs_hesap or "Digər"
+        if kat not in kategoriler:
+            kategoriler[kat] = {"ad": kat, "medaxil": 0, "mexaric": 0, "sayi": 0}
+        mebleg_val = float(h.mebleg)
+        if h.islem_turu == IslemTuru.MEDAXIL or mebleg_val > 0:
+            kategoriler[kat]["medaxil"] += abs(mebleg_val)
+        else:
+            kategoriler[kat]["mexaric"] += abs(mebleg_val)
+        kategoriler[kat]["sayi"] += 1
+
+    toplam_medaxil = sum(g["medaxil"] for g in gruplar.values())
+    toplam_mexaric = sum(g["mexaric"] for g in gruplar.values())
+
+    return {
+        "rapor_turu": rapor_turu,
+        "toplam_medaxil": toplam_medaxil,
+        "toplam_mexaric": toplam_mexaric,
+        "fark": toplam_medaxil - toplam_mexaric,
+        "toplam_emeliyyat": len(hareketler),
+        "donemler": sorted(gruplar.values(), key=lambda x: x["donem"], reverse=True),
+        "kategoriler": sorted(kategoriler.values(), key=lambda x: x["mexaric"], reverse=True),
+    }
+
+@app.get("/hesaplar/{hesap_id}/bakiye")
+def hesap_bakiye(hesap_id: int, db: Session = Depends(get_db)):
+    """Hesabın açılış və bağlanış qalığı"""
+    hesap = db.query(BankaHesap).filter(BankaHesap.id == hesap_id).first()
+    if not hesap:
+        raise HTTPException(status_code=404, detail="Hesab tapılmadı")
+
+    hareketler = db.query(BankaHareketi).filter(
+        BankaHareketi.hesap_id == hesap_id
+    ).order_by(BankaHareketi.tarixi.asc()).all()
+
+    medaxil = sum(float(h.mebleg) for h in hareketler if h.islem_turu == IslemTuru.MEDAXIL or float(h.mebleg) > 0)
+    mexaric = sum(abs(float(h.mebleg)) for h in hareketler if h.islem_turu == IslemTuru.MEXARIC or float(h.mebleg) < 0)
+
+    return {
+        "hesap_id": hesap_id,
+        "sirket_adi": hesap.sirket_adi,
+        "banka_adi": hesap.banka_adi,
+        "iban": hesap.iban,
+        "valyuta": hesap.valyuta,
+        "toplam_medaxil": medaxil,
+        "toplam_mexaric": mexaric,
+        "net_qaliq": medaxil - mexaric,
+        "son_bakiye": float(hareketler[-1].bakiye) if hareketler and hareketler[-1].bakiye else 0,
+        "toplam_emeliyyat": len(hareketler),
+    }
+
+@app.get("/tum-hareketler")
+def tum_hareketler(
+    baslangic: Optional[str] = None,
+    bitis: Optional[str] = None,
+    islem_turu: Optional[str] = None,
+    arama: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Bütün hesablardan hərəkətlər (axtarış və filter ilə)"""
+    query = db.query(BankaHareketi)
+
+    if baslangic:
+        query = query.filter(BankaHareketi.tarixi >= datetime.strptime(baslangic, "%Y-%m-%d"))
+    if bitis:
+        query = query.filter(BankaHareketi.tarixi <= datetime.strptime(bitis, "%Y-%m-%d"))
+    if islem_turu:
+        query = query.filter(BankaHareketi.islem_turu == IslemTuru(islem_turu))
+    if arama:
+        query = query.filter(
+            (BankaHareketi.teyinat.ilike(f"%{arama}%")) |
+            (BankaHareketi.acs_hesap.ilike(f"%{arama}%")) |
+            (BankaHareketi.sened_no.ilike(f"%{arama}%"))
+        )
+
+    toplam = query.count()
+    hareketler = query.order_by(BankaHareketi.tarixi.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "toplam": toplam,
+        "hareketler": [{
+            "id": h.id,
+            "hesap_id": h.hesap_id,
+            "tarixi": h.tarixi.isoformat(),
+            "islem_turu": h.islem_turu.value if isinstance(h.islem_turu, IslemTuru) else str(h.islem_turu),
+            "mebleg": float(h.mebleg),
+            "valyuta": h.valyuta,
+            "bakiye": float(h.bakiye) if h.bakiye else None,
+            "teyinat": h.teyinat,
+            "acs_hesap": h.acs_hesap,
+            "sened_no": h.sened_no,
+            "kategori": h.kategori,
+            "kaynak_dosya": h.kaynak_dosya,
+        } for h in hareketler]
     }
 
 # ============ RAPORLAR ============
